@@ -335,6 +335,8 @@ impl std::fmt::Display for NoSolutionError {
         collapse_unavailable_versions(&mut tree);
         collapse_redundant_depends_on_no_versions(&mut tree);
 
+        simplify_derivation_tree_ranges(&mut tree, &self.available_versions);
+
         if should_display_tree {
             display_tree(&tree, "Resolver derivation tree after reduction");
         }
@@ -943,4 +945,90 @@ impl std::fmt::Display for NoSolutionHeader {
             ),
         }
     }
+}
+
+/// Given a [`DerivationTree`], simplify version ranges using the available versions for each package.
+fn simplify_derivation_tree_ranges(
+    tree: &mut DerivationTree<PubGrubPackage, Range<Version>, UnavailableReason>,
+    available_versions: &FxHashMap<PackageName, BTreeSet<Version>>,
+) {
+    match tree {
+        DerivationTree::External(external) => {
+            match external {
+                External::FromDependencyOf(package1, versions1, package2, versions2) => {
+                    // Simplify both version ranges
+                    *versions1 = simplify_range(versions1, package1, available_versions);
+                    *versions2 = simplify_range(versions2, package2, available_versions);
+                }
+                External::NoVersions(package, versions) => {
+                    *versions = simplify_range(versions, package, available_versions);
+                }
+                External::Custom(package, versions, _) => {
+                    *versions = simplify_range(versions, package, available_versions);
+                }
+                External::NotRoot(..) => (),
+            }
+        }
+        DerivationTree::Derived(derived) => {
+            // Recursively simplify both sides of the tree
+            simplify_derivation_tree_ranges(Arc::make_mut(&mut derived.cause1), available_versions);
+            simplify_derivation_tree_ranges(Arc::make_mut(&mut derived.cause2), available_versions);
+
+            // Simplify the terms
+            derived.terms = std::mem::take(&mut derived.terms)
+                .into_iter()
+                .map(|(pkg, term)| {
+                    let term = match term {
+                        Term::Positive(versions) => {
+                            Term::Positive(simplify_range(&versions, &pkg, available_versions))
+                        }
+                        Term::Negative(versions) => {
+                            Term::Negative(simplify_range(&versions, &pkg, available_versions))
+                        }
+                    };
+                    (pkg, term)
+                })
+                .collect();
+        }
+    }
+}
+
+/// Helper function to simplify a version range using available versions for a package
+fn simplify_range(
+    range: &Range<Version>,
+    package: &PubGrubPackage,
+    available_versions: &FxHashMap<PackageName, BTreeSet<Version>>,
+) -> Range<Version> {
+    // Extract package name from PubGrubPackage
+    let name = match &**package {
+        PubGrubPackageInner::Package { name, .. }
+        | PubGrubPackageInner::Extra { name, .. }
+        | PubGrubPackageInner::Dev { name, .. } => Some(name),
+        _ => None,
+    };
+
+    // If we can't get the name or there are no available versions, return the original range
+    let Some(name) = name else {
+        return range.clone();
+    };
+
+    // If this is a full range, return as-is
+    if range == &Range::full() {
+        return range.clone();
+    }
+
+    // Get the available versions for this package
+    let Some(versions) = available_versions.get(name) else {
+        return range.clone();
+    };
+
+    // If there's only one version available and it's in the range, return just that version
+    if let Some(version) = versions.iter().next() {
+        if versions.len() == 1 && range.contains(version) {
+            return Range::singleton(version.clone());
+        }
+    }
+
+    // Simplify the range using available versions
+    range.simplify(versions.iter())
 }
