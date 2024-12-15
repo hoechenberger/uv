@@ -31,7 +31,7 @@ use uv_distribution_types::{
 use uv_git::GitResolver;
 use uv_normalize::{ExtraName, GroupName, PackageName};
 use uv_pep440::{release_specifiers_to_ranges, Version, VersionSpecifiers, MIN_VERSION};
-use uv_pep508::MarkerTree;
+use uv_pep508::{MarkerExpression, MarkerOperator, MarkerTree, MarkerValueString};
 use uv_platform_tags::Tags;
 use uv_pypi_types::{
     ConflictItem, ConflictItemRef, Conflicts, Requirement, ResolutionMetadata, VerbatimParsedUrl,
@@ -61,7 +61,9 @@ pub(crate) use crate::resolver::availability::{
 use crate::resolver::batch_prefetch::BatchPrefetcher;
 pub use crate::resolver::derivation::DerivationChainBuilder;
 pub use crate::resolver::environment::ResolverEnvironment;
-use crate::resolver::environment::{fork_python_requirement, ForkingPossibility};
+use crate::resolver::environment::{
+    fork_version_by_marker, fork_version_by_python_requirement, ForkingPossibility,
+};
 pub(crate) use crate::resolver::fork_map::{ForkMap, ForkSet};
 pub(crate) use crate::resolver::urls::Urls;
 use crate::universal_marker::{ConflictMarker, UniversalMarker};
@@ -1127,7 +1129,11 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
         {
             if matches!(self.options.fork_strategy, ForkStrategy::RequiresPython) {
                 if env.marker_environment().is_none() {
-                    let forks = fork_python_requirement(requires_python, python_requirement, env);
+                    let forks = fork_version_by_python_requirement(
+                        requires_python,
+                        python_requirement,
+                        env,
+                    );
                     if !forks.is_empty() {
                         debug!(
                             "Forking Python requirement `{}` on `{}` for {}=={} ({})",
@@ -1150,6 +1156,56 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                 candidate.version().clone(),
                 UnavailableVersion::IncompatibleDist(incompatibility),
             )));
+        }
+
+        // Check whether this version covers all supported platforms.
+        if !dist.implied_markers().is_true() {
+            for marker in [
+                MarkerTree::expression(MarkerExpression::String {
+                    key: MarkerValueString::SysPlatform,
+                    operator: MarkerOperator::Equal,
+                    value: "linux".to_string(),
+                }),
+                MarkerTree::expression(MarkerExpression::String {
+                    key: MarkerValueString::SysPlatform,
+                    operator: MarkerOperator::Equal,
+                    value: "win32".to_string(),
+                }),
+                MarkerTree::expression(MarkerExpression::String {
+                    key: MarkerValueString::SysPlatform,
+                    operator: MarkerOperator::Equal,
+                    value: "darwin".to_string(),
+                }),
+            ] {
+                // If the platform is part of the current environment...
+                if env.included_by_marker(marker) {
+                    // But isn't supported by the distribution...
+                    if dist.implied_markers().is_disjoint(marker) {
+                        // Then we need to fork.
+                        let forks = fork_version_by_marker(env, marker);
+                        return if forks.is_empty() {
+                            Ok(Some(ResolverVersion::Unavailable(
+                                candidate.version().clone(),
+                                UnavailableVersion::IncompatibleDist(IncompatibleDist::Wheel(
+                                    IncompatibleWheel::NoBinary,
+                                )),
+                            )))
+                        } else {
+                            debug!(
+                                "Forking platform for {}=={} ({})",
+                                name,
+                                candidate.version(),
+                                forks
+                                    .iter()
+                                    .map(ToString::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            );
+                            Ok(Some(ResolverVersion::Forked(forks)))
+                        };
+                    }
+                }
+            }
         }
 
         let filename = match dist.for_installation() {
