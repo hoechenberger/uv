@@ -13,7 +13,7 @@ use dashmap::DashMap;
 use either::Either;
 use futures::{FutureExt, StreamExt};
 use itertools::Itertools;
-use pubgrub::{Id, Incompatibility, Range, Ranges, State, Term};
+use pubgrub::{Id, IncompId, Incompatibility, Range, Ranges, State};
 use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::oneshot;
@@ -328,17 +328,9 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
             loop {
                 // Run unit propagation.
                 let result = state.pubgrub.unit_propagation(state.next);
-                // End the mutable borrow of `state.pubgrub`.
-                let result = result.map(|conflict| {
-                    conflict.map(|conflict| {
-                        conflict
-                            .map(|(package, term)| (package, term.clone()))
-                            .collect::<Vec<_>>()
-                    })
-                });
                 match result {
                     Err(err) => {
-                        // If unit propagation failed, the is no solution.
+                        // If unit propagation failed, there is no solution.
                         return Err(self.convert_no_solution_err(
                             err,
                             state.fork_urls,
@@ -349,14 +341,13 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                             &self.capabilities,
                         ));
                     }
-                    Ok(Some(conflict)) => {
-                        // Conflict tracking: If the version was rejected due to its dependencies,
-                        // record culprit and affected.
-                        state.record_conflict(state.next, None, &conflict);
+                    Ok(conflicts) => {
+                        for (affected, incompatibility) in conflicts {
+                            // Conflict tracking: If there was a conflict, track affected and
+                            // culprit for all root cause incompatibilities
+                            state.record_conflict(affected, None, incompatibility);
+                        }
                     }
-                    // There was no conflict, or we've already rejected the last version due to its
-                    // dependencies.
-                    Ok(None) => {}
                 }
 
                 // Pre-visit all candidate packages, to allow metadata to be fetched in parallel.
@@ -2351,14 +2342,11 @@ impl ForkState {
                 (package, version)
             }),
         );
-        // End the mutable borrow of `self.pubgrub`
-        let conflict: Option<Vec<_>> =
-            conflict.map(|x| x.map(|(package, term)| (package, term.clone())).collect());
 
         // Conflict tracking: If the version was rejected due to its dependencies, record culprit
         // and affected.
-        if let Some(conflict) = conflict {
-            self.record_conflict(for_package, Some(for_version), &conflict);
+        if let Some(incompatibility) = conflict {
+            self.record_conflict(for_package, Some(for_version), incompatibility);
         }
         Ok(())
     }
@@ -2367,15 +2355,15 @@ impl ForkState {
         &mut self,
         affected: Id<PubGrubPackage>,
         version: Option<&Version>,
-        conflict: &[(Id<PubGrubPackage>, Term<Ranges<Version>>)],
+        incompatibility: IncompId<PubGrubPackage, Ranges<Version>, UnavailableReason>,
     ) {
         let mut culprit_is_real = false;
-        for (incompatible, _term) in conflict {
-            if *incompatible == affected {
+        for (incompatible, _term) in self.pubgrub.incompatibility_store[incompatibility].iter() {
+            if incompatible == affected {
                 continue;
             }
             if self.pubgrub.package_store[affected].name()
-                == self.pubgrub.package_store[*incompatible].name()
+                == self.pubgrub.package_store[incompatible].name()
             {
                 // Don't track conflicts between a marker package and the main package, when the
                 // marker is "copying" the obligations from the main package through conflicts.
@@ -2385,21 +2373,21 @@ impl ForkState {
             let culprit_count = self
                 .conflict_tracker
                 .culprit
-                .entry(*incompatible)
+                .entry(incompatible)
                 .or_default();
             *culprit_count += 1;
             if *culprit_count == CONFLICT_THRESHOLD {
-                self.conflict_tracker.depriotize.push(*incompatible);
+                self.conflict_tracker.depriotize.push(incompatible);
             }
         }
         // Don't track conflicts between a marker package and the main package, when the
         // marker is "copying" the obligations from the main package through conflicts.
         if culprit_is_real {
             if tracing::enabled!(Level::DEBUG) {
-                let incompatibility = conflict
+                let incompatibility = self.pubgrub.incompatibility_store[incompatibility]
                     .iter()
                     .map(|(package, _term)| {
-                        format!("{:?}", self.pubgrub.package_store[*package].clone(),)
+                        format!("{:?}", self.pubgrub.package_store[package].clone(),)
                     })
                     .join(", ");
                 if let Some(version) = version {
